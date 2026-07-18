@@ -2,6 +2,8 @@
 
 即時顯示 PTT Stock 版「盤中 / 盤後」閒聊串推文的桌面彈幕（Python + PyQt6 + WebSocket）。
 
+![PTT Stock 彈幕預覽](docs/preview.png)
+
 ## 特色
 
 - 純 `wss://ws.ptt.cc/bbs` 終端串流（不爬 web 版）
