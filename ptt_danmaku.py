@@ -14,6 +14,7 @@ import base64
 import hashlib
 import os
 import queue
+import random
 import re
 import sys
 import threading
@@ -27,7 +28,9 @@ import websocket
 from websocket import WebSocketConnectionClosedException
 
 from PyQt6.QtCore import Qt, QTimer, pyqtSignal, QObject, QRectF, QPoint, QPointF, QSize
-from PyQt6.QtGui import QPainter, QFont, QColor, QPen, QAction, QPixmap, QFontMetrics
+from PyQt6.QtGui import (
+    QPainter, QFont, QColor, QPen, QAction, QPixmap, QFontMetrics, QImageReader, QImage,
+)
 from PyQt6.QtWidgets import QApplication, QWidget, QMenu
 
 # ===================== PTT constants =====================
@@ -592,9 +595,9 @@ class PTTWebSocketClient(QObject):
         self._last_action_time: float = 0.0
         self._last_screen: Screen = Screen.UNKNOWN
         self._last_space_time: float = 0.0
-        # 進正確目標文後，待滿 interval 才 LEFT 刷新（PttChrome Live 文小幫手節奏）
+        # 進正確目標文後，待滿 interval 才 LEFT 刷新（減輕 PTT 負擔：5–10 秒隨機）
         self._article_entered_at: float = 0.0
-        self._refresh_interval: float = 5.0  # Live 刷新間隔（秒）；PttChrome 預設可更短
+        self._refresh_interval: float = self._next_refresh_interval()
         # 短 cooldown key 對齊 PttChrome：LEFT+RIGHT+END 中 RIGHT 後必須驗文
 
     def start(self):
@@ -628,6 +631,11 @@ class PTTWebSocketClient(QObject):
                 return True
             time.sleep(min(0.2, end - time.time()))
         return self._stop.is_set()
+
+    @staticmethod
+    def _next_refresh_interval() -> float:
+        """Live 刷新間隔：5–10 秒均勻隨機，避免固定節奏壓站。"""
+        return random.uniform(5.0, 10.0)
 
     # ---------- IO ----------
 
@@ -1012,18 +1020,19 @@ class PTTWebSocketClient(QObject):
             if self._act("article_end", PTT_KEY_END):
                 return
 
-        # --- 定期 LEFT 回列表刷新（anchor 可能變，回列表後重檢查再進）---
+        # --- 定期 LEFT 回列表刷新（5–10s 隨機；回列表後重定位再進）---
         if now - self._article_entered_at >= self._refresh_interval:
             if self._act("refresh_leave", PTT_KEY_LEFT):
                 self._article_entered_at = 0.0
+                self._refresh_interval = self._next_refresh_interval()
                 return
 
-        # 文末輕量 keepalive（空白）；非文末則偶發再 END
-        if not at_end and now - self._last_space_time > 8.0:
+        # 文末輕量 keepalive（空白）；間隔略放長，減少多餘按鍵
+        if not at_end and now - self._last_space_time > 10.0:
             if self._act("article_end", PTT_KEY_END):
                 return
 
-        if now - self._last_space_time > 3.5:
+        if now - self._last_space_time > 6.0:
             self._send_text(" ")
             self._last_space_time = now
             self._last_action_key = "article_space"
@@ -1168,8 +1177,80 @@ def cache_key_for_url(url: str) -> str:
     return hashlib.sha1(url.encode("utf-8")).hexdigest()
 
 
+@dataclass
+class CachedImage:
+    """靜態圖或 GIF 多幀；彈幕飛行期間依時間 loop 播。"""
+    frames: List[QPixmap]
+    delays_ms: List[int]
+    total_ms: int = 0
+
+    def __post_init__(self):
+        if not self.delays_ms and self.frames:
+            self.delays_ms = [100] * len(self.frames)
+        if len(self.delays_ms) < len(self.frames):
+            self.delays_ms.extend([100] * (len(self.frames) - len(self.delays_ms)))
+        # GIF delay 0 常見 → 用 100ms；下限 20ms 避免狂轉
+        self.delays_ms = [max(20, d if d > 0 else 100) for d in self.delays_ms[: len(self.frames)]]
+        self.total_ms = max(1, sum(self.delays_ms))
+
+    @property
+    def is_animated(self) -> bool:
+        return len(self.frames) > 1
+
+    def frame_at(self, t_sec: float) -> QPixmap:
+        if not self.frames:
+            return QPixmap()
+        if len(self.frames) == 1:
+            return self.frames[0]
+        ms = int(t_sec * 1000.0) % self.total_ms
+        acc = 0
+        for pm, d in zip(self.frames, self.delays_ms):
+            acc += d
+            if ms < acc:
+                return pm
+        return self.frames[-1]
+
+    def first(self) -> QPixmap:
+        return self.frames[0] if self.frames else QPixmap()
+
+
+def load_cached_image_from_path(path: str) -> Optional[CachedImage]:
+    """用 QImageReader 載入；GIF 拆成多幀 + delay（loop 由 frame_at 負責）。"""
+    if not path or not os.path.isfile(path):
+        return None
+    reader = QImageReader(path)
+    if not reader.canRead():
+        pm = QPixmap(path)
+        if pm.isNull():
+            return None
+        return CachedImage(frames=[pm], delays_ms=[100])
+
+    frames: List[QPixmap] = []
+    delays: List[int] = []
+    # Qt 上 jumpToNextImage 對部分 GIF 不可靠，改 imageCount + jumpToImage
+    n = reader.imageCount()
+    if n <= 0:
+        n = 1
+    n = min(n, 200)
+    for i in range(n):
+        if n > 1:
+            reader.jumpToImage(i)
+        img = reader.read()
+        if img.isNull():
+            break
+        frames.append(QPixmap.fromImage(img))
+        delays.append(int(reader.nextImageDelay()))
+
+    if not frames:
+        pm = QPixmap(path)
+        if pm.isNull():
+            return None
+        return CachedImage(frames=[pm], delays_ms=[100])
+    return CachedImage(frames=frames, delays_ms=delays)
+
+
 class ImageCache(QObject):
-    """下載圖片到 image/，記憶體 + 磁碟快取；完成後 emit image_ready(url)。"""
+    """下載圖片到 image/，記憶體 + 磁碟快取；支援 GIF 多幀 loop。"""
 
     image_ready = pyqtSignal(str)
 
@@ -1177,7 +1258,7 @@ class ImageCache(QObject):
         super().__init__()
         self.root = root_dir
         os.makedirs(self.root, exist_ok=True)
-        self._mem: Dict[str, QPixmap] = {}
+        self._mem: Dict[str, CachedImage] = {}
         self._inflight: Set[str] = set()
         self._failed: Set[str] = set()
         self._lock = threading.Lock()
@@ -1185,22 +1266,32 @@ class ImageCache(QObject):
     def disk_path(self, url: str) -> str:
         return os.path.join(self.root, cache_key_for_url(url) + ".img")
 
-    def get(self, url: str) -> Optional[QPixmap]:
+    def get(self, url: str) -> Optional[CachedImage]:
         if not url or url in self._failed:
             return None
         with self._lock:
-            pm = self._mem.get(url)
-        if pm is not None and not pm.isNull():
-            return pm
+            ci = self._mem.get(url)
+        if ci is not None and ci.frames:
+            return ci
         path = self.disk_path(url)
         if os.path.isfile(path) and os.path.getsize(path) > 32:
-            pm = QPixmap()
-            if pm.load(path):
+            ci = load_cached_image_from_path(path)
+            if ci is not None:
                 with self._lock:
-                    self._mem[url] = pm
-                return pm
+                    self._mem[url] = ci
+                return ci
         self.request(url)
         return None
+
+    def get_pixmap(self, url: str, t_sec: Optional[float] = None) -> Optional[QPixmap]:
+        """取目前應顯示的那一幀（GIF 依 t_sec loop）。"""
+        ci = self.get(url)
+        if ci is None or not ci.frames:
+            return None
+        if t_sec is None:
+            return ci.first()
+        pm = ci.frame_at(t_sec)
+        return pm if pm and not pm.isNull() else None
 
     def request(self, url: str):
         if not url or url in self._failed:
@@ -1210,18 +1301,16 @@ class ImageCache(QObject):
                 return
             path = self.disk_path(url)
             if os.path.isfile(path) and os.path.getsize(path) > 32:
-                # 磁碟有、記憶體沒：主線程 load
                 pass
             else:
                 self._inflight.add(url)
                 t = threading.Thread(target=self._download, args=(url,), daemon=True)
                 t.start()
                 return
-        # load from disk on caller thread
-        pm = QPixmap()
-        if pm.load(path):
+        ci = load_cached_image_from_path(path)
+        if ci is not None:
             with self._lock:
-                self._mem[url] = pm
+                self._mem[url] = ci
             self.image_ready.emit(url)
 
     def _download(self, url: str):
@@ -1233,30 +1322,19 @@ class ImageCache(QObject):
                 headers={
                     "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
                     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
-                    "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
+                    "Accept": "image/avif,image/webp,image/apng,image/gif,image/*,*/*;q=0.8",
                 },
             )
             r.raise_for_status()
             data = r.content
             if len(data) < 32:
                 raise ValueError("image too small")
-            # 簡易 magic check
-            if not (
-                data[:3] == b"\xff\xd8\xff"  # jpeg
-                or data[:8] == b"\x89PNG\r\n\x1a\n"
-                or data[:6] in (b"GIF87a", b"GIF89a")
-                or data[:4] == b"RIFF"
-                or data[:4] == b"\x00\x00\x00\x20"  # some webp
-                or data[:4] == b"RIFF"
-                or b"WEBP" in data[:16]
-            ):
-                # 仍寫入，QPixmap 可能認得
-                pass
             tmp = path + ".part"
             with open(tmp, "wb") as f:
                 f.write(data)
             os.replace(tmp, path)
-            print(f"[INFO] 圖片已快取: {url[:60]}… → {os.path.basename(path)}")
+            kind = "GIF" if data[:6] in (b"GIF87a", b"GIF89a") else "IMG"
+            print(f"[INFO] 圖片已快取({kind}): {url[:60]}… → {os.path.basename(path)}")
         except Exception as e:
             print(f"[INFO] 圖片下載失敗: {url[:50]}… ({e})")
             with self._lock:
@@ -1265,23 +1343,20 @@ class ImageCache(QObject):
             return
         with self._lock:
             self._inflight.discard(url)
-        # 通知 UI 線程載入
         self.image_ready.emit(url)
 
-    def load_into_mem(self, url: str) -> Optional[QPixmap]:
-        """主線程呼叫：從 disk 載入 QPixmap。"""
+    def load_into_mem(self, url: str) -> Optional[CachedImage]:
+        """主線程呼叫：從 disk 載入（含 GIF 幀）。"""
         with self._lock:
             if url in self._mem:
                 return self._mem[url]
         path = self.disk_path(url)
-        if not os.path.isfile(path):
-            return None
-        pm = QPixmap()
-        if not pm.load(path):
+        ci = load_cached_image_from_path(path)
+        if ci is None:
             return None
         with self._lock:
-            self._mem[url] = pm
-        return pm
+            self._mem[url] = ci
+        return ci
 
 
 # ===================== Danmaku overlay (UI/UX) =====================
@@ -1415,11 +1490,13 @@ class ControlHandle(QWidget):
 
     def mouseReleaseEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
-            # 幾乎沒拖 → 當點擊開選單
+            # 幾乎沒拖 → 當點擊開選單；有拖曳 → 吸附邊緣
             if self._drag_origin is not None:
                 d = event.globalPosition().toPoint() - self._drag_origin
                 if abs(d.x()) + abs(d.y()) < 4:
                     self.menu_requested.emit()
+                else:
+                    self._overlay.snap_to_screen_edge()
             self._drag_origin = None
             self._win_origin = None
 
@@ -1430,13 +1507,15 @@ class ControlHandle(QWidget):
 class DanmakuOverlay(QWidget):
     """
     半寬彈幕 + header 狀態 + 密度 + 排隊 + 分層上色 + 同人合併。
-    可滑鼠拖曳整窗；左上把手也可拖 / 開選單。穿透模式開時只剩把手可點。
+    可滑鼠拖曳整窗、靠近螢幕邊緣吸附；左上把手也可拖 / 開選單。
     """
 
     HEADER_H = 28
     PAD_Y = 10
     PENDING_MAX_AGE = 30.0
     MERGE_WINDOW = 2.8
+    # 拖曳放開時，距邊緣小於此像素則吸附
+    SNAP_THRESHOLD = 36
 
     def __init__(self):
         super().__init__()
@@ -1552,16 +1631,18 @@ class DanmakuOverlay(QWidget):
         self._drop_stale_pending(now)
 
     def _on_image_ready(self, url: str):
-        """背景下載完成 → 主線程載入 pixmap，重算進行中彈幕寬度並刷新。"""
-        pm = self._images.load_into_mem(url)
-        if pm is None or pm.isNull():
+        """背景下載完成 → 主線程載入（含 GIF 幀），重算進行中彈幕寬度並刷新。"""
+        ci = self._images.load_into_mem(url)
+        if ci is None or not ci.frames:
             return
+        if ci.is_animated:
+            print(f"[INFO] GIF {len(ci.frames)} 幀 loop 播放: {url[:50]}…")
         changed = False
         for item in self.active:
             if url in item.image_urls:
                 item.width = self._measure_line_with_images(item.text, item.image_urls)
                 changed = True
-        if changed:
+        if changed or ci.is_animated:
             self.update()
 
     def add_comment(self, text: str, color: Optional[QColor] = None):
@@ -1633,6 +1714,38 @@ class DanmakuOverlay(QWidget):
         gp = self.mapToGlobal(QPoint(4, 4))
         self._handle.move(gp.x() - 32, gp.y())
 
+    def _screen_geo_for_window(self):
+        """視窗中心所在螢幕的可用區域（避開選單列 / Dock）。"""
+        center = self.frameGeometry().center()
+        scr = QApplication.screenAt(center) or QApplication.primaryScreen()
+        return scr.availableGeometry()
+
+    def snap_to_screen_edge(self):
+        """靠近邊緣時吸附；可同時吸附水平+垂直（角落）。"""
+        geo = self._screen_geo_for_window()
+        x, y = self.x(), self.y()
+        w, h = self.width(), self.height()
+        thr = self.SNAP_THRESHOLD
+
+        # 水平
+        if abs(x - geo.left()) <= thr:
+            x = geo.left()
+        elif abs((x + w) - (geo.right() + 1)) <= thr or abs((x + w) - geo.right()) <= thr:
+            x = geo.right() - w + 1
+        # 垂直
+        if abs(y - geo.top()) <= thr:
+            y = geo.top()
+        elif abs((y + h) - (geo.bottom() + 1)) <= thr or abs((y + h) - geo.bottom()) <= thr:
+            y = geo.bottom() - h + 1
+
+        # 確保整窗仍在可用區域內
+        x = max(geo.left(), min(x, geo.right() - w + 1))
+        y = max(geo.top(), min(y, geo.bottom() - h + 1))
+
+        if x != self.x() or y != self.y():
+            self.move(x, y)
+            self._reposition_handle()
+
     def moveEvent(self, event):
         super().moveEvent(event)
         self._reposition_handle()
@@ -1676,8 +1789,14 @@ class DanmakuOverlay(QWidget):
 
     def mouseReleaseEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
+            dragged = False
+            if self._drag_origin is not None:
+                d = event.globalPosition().toPoint() - self._drag_origin
+                dragged = abs(d.x()) + abs(d.y()) >= 4
             self._drag_origin = None
             self._win_origin = None
+            if dragged and not self.click_through:
+                self.snap_to_screen_edge()
             if not self.click_through:
                 if event.position().y() <= self.HEADER_H:
                     self.setCursor(Qt.CursorShape.OpenHandCursor)
@@ -1795,7 +1914,8 @@ class DanmakuOverlay(QWidget):
     def _image_display_size(self, url: str) -> QSize:
         """圖高度 = row 高；未載入則用 [圖] 文字寬。"""
         h = max(16, self.ROW_H - 8)
-        pm = self._images.get(url)
+        ci = self._images.get(url)
+        pm = ci.first() if ci else None
         if pm is None or pm.isNull():
             return QSize(int(self._measure(IMG_PLACEHOLDER)), h)
         src_w = max(1, pm.width())
@@ -1887,6 +2007,7 @@ class DanmakuOverlay(QWidget):
                     self._pending.pop(0)
 
         self._reposition_handle()
+        # 每幀重畫：彈幕位移 + GIF 依時間 loop
         self.update()
 
     # ----- paint -----
@@ -1950,14 +2071,17 @@ class DanmakuOverlay(QWidget):
             header,
         )
 
-        # 彈幕：一段連續文字（同色）；僅 [圖] 換成圖片
+        # 彈幕：一段連續文字；[圖] 處播靜態圖或 GIF loop（隨彈幕移動持續播）
         painter.setFont(self.font)
         painter.setClipping(False)
         body_top = self.HEADER_H + self.PAD_Y
+        now = time.time()
         for item in self.active:
             y = body_top + item.lane * self.ROW_H
+            # 以彈幕存活時間當動畫時軸 → 飛行期間 loop
+            anim_t = max(0.0, now - item.created_at)
             self._paint_line_with_images(
-                painter, item.x, y, item.text, item.image_urls, item.accent
+                painter, item.x, y, item.text, item.image_urls, item.accent, anim_t
             )
 
     def _paint_line_with_images(
@@ -1968,8 +2092,9 @@ class DanmakuOverlay(QWidget):
         text: str,
         image_urls: List[str],
         accent: QColor,
+        anim_t: float = 0.0,
     ) -> float:
-        """把 text 當連續字串畫；碰到 [圖] 插入圖（高度=row）。"""
+        """連續字串；[圖] 插入圖片。GIF 用 anim_t loop 換幀。"""
         parts = text.split(IMG_PLACEHOLDER)
         img_i = 0
         img_h = max(16, self.ROW_H - 8)
@@ -1983,7 +2108,7 @@ class DanmakuOverlay(QWidget):
             if i < len(parts) - 1:
                 url = image_urls[img_i] if img_i < len(image_urls) else ""
                 img_i += 1
-                pm = self._images.get(url) if url else None
+                pm = self._images.get_pixmap(url, anim_t) if url else None
                 if pm is not None and not pm.isNull():
                     sz = self._image_display_size(url)
                     scaled = pm.scaled(
