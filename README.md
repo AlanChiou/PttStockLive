@@ -37,6 +37,7 @@ cp .pttrc.example .pttrc
 # 編輯 .pttrc
 export PTT_ACCOUNT=你的帳號
 export PTT_PASSWORD=你的密碼
+chmod 600 .pttrc
 ```
 
 或直接：
@@ -45,6 +46,12 @@ export PTT_PASSWORD=你的密碼
 export PTT_ACCOUNT=你的帳號
 export PTT_PASSWORD=你的密碼
 ```
+
+可選環境變數：
+
+| 變數 | 預設 | 說明 |
+|------|------|------|
+| `PTT_KICK_OTHER` | `1` | 偵測到重複登入時是否踢掉其他連線（`0`/`n` 則送 n） |
 
 ## 執行
 
@@ -80,8 +87,10 @@ python3 test_ws.py "https://www.ptt.cc/bbs/Stock/M.xxxx.A.xxx.html"
 ## 注意
 
 - 需要有效 PTT 帳密；guest 導航成功率低
+- 預設重複登入會踢掉其他連線（`PTT_KICK_OTHER=0` 可改為保留）
 - WS 連線可能中斷，程式會自動重試
 - Live 刷新間隔約 5–10 秒隨機（LEFT 回列表再進），請勿改成過短以免增加 PTT 負擔
+- 推文圖片僅允許常見圖床 host，且有大小/並發上限
 - 圖片快取目錄 `image/` 為執行期產物，已在 `.gitignore`
 - 請遵守 PTT 站規，勿高頻洗連線
 - **切勿**把 `.pttrc`、帳號密碼 commit 到 git 或貼給陌生人

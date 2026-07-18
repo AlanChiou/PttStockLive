@@ -1,3 +1,7 @@
 # Copy to .pttrc and fill in your PTT credentials (never commit .pttrc)
+# chmod 600 .pttrc
 export PTT_ACCOUNT=your_ptt_id
 export PTT_PASSWORD=your_ptt_password
+
+# Optional: 1=kick other sessions on duplicate login (default), 0=keep them
+# export PTT_KICK_OTHER=1

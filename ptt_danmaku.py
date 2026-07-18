@@ -12,26 +12,38 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import ipaddress
 import os
 import queue
 import random
 import re
+import socket
 import sys
 import threading
 import time
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from enum import Enum, auto
 from typing import Callable, Dict, List, Optional, Set, Tuple
+from urllib.parse import urlparse
 
 import requests
 import websocket
 from websocket import WebSocketConnectionClosedException
 
-from PyQt6.QtCore import Qt, QTimer, pyqtSignal, QObject, QRectF, QPoint, QPointF, QSize
+from PyQt6.QtCore import Qt, QTimer, pyqtSignal, QObject, QRectF, QPoint, QSize
 from PyQt6.QtGui import (
-    QPainter, QFont, QColor, QPen, QAction, QPixmap, QFontMetrics, QImageReader, QImage,
+    QPainter, QFont, QColor, QPen, QAction, QPixmap, QFontMetrics, QImageReader,
 )
 from PyQt6.QtWidgets import QApplication, QWidget, QMenu
+
+from ptt_common import (
+    encode_big5,
+    encode_login_field,
+    env_kick_other_sessions,
+    load_ptt_credentials,
+    try_decode,
+)
 
 # ===================== PTT constants =====================
 
@@ -82,29 +94,7 @@ STATUS_ROW_RE = re.compile(
 )
 
 
-# ===================== decode / credentials =====================
-
-def try_decode(data: bytes) -> str:
-    try:
-        import uao
-        return data.decode("uao", errors="replace")
-    except Exception:
-        pass
-    for enc in ("big5hkscs", "big5", "cp950"):
-        try:
-            return data.decode(enc, errors="replace")
-        except Exception:
-            continue
-    return data.decode("utf-8", errors="replace")
-
-
-def encode_big5(text: str) -> bytes:
-    try:
-        import uao
-        return uao.encode(text)
-    except Exception:
-        return text.encode("big5hkscs", errors="replace")
-
+# ===================== helpers =====================
 
 def _log_safe(text: str, max_len: int = 160) -> str:
     if not text:
@@ -113,43 +103,6 @@ def _log_safe(text: str, max_len: int = 160) -> str:
     text = text.replace("\ufffd", "?")
     text = "".join(c if (c.isprintable() or c in " \t") else "?" for c in text)
     return text[:max_len]
-
-
-def load_ptt_credentials() -> Tuple[Optional[str], Optional[str]]:
-    account = os.environ.get("PTT_ACCOUNT") or os.environ.get("PTT_ID")
-    password = os.environ.get("PTT_PASSWORD") or os.environ.get("PTT_PASS")
-    if account and password:
-        return account, password
-
-    candidates = [
-        ".pttrc",
-        os.path.expanduser("~/.pttrc"),
-        ".env",
-        os.path.expanduser("~/.env"),
-    ]
-    for path in candidates:
-        if not os.path.isfile(path):
-            continue
-        try:
-            with open(path, "r", encoding="utf-8", errors="ignore") as f:
-                content = f.read()
-            env = {}
-            for line in content.splitlines():
-                line = line.strip()
-                if not line or line.startswith("#"):
-                    continue
-                if line.startswith("export "):
-                    line = line[7:].strip()
-                if "=" in line:
-                    k, v = line.split("=", 1)
-                    env[k.strip()] = v.strip().strip("\"'")
-            acc = env.get("PTT_ACCOUNT") or env.get("PTT_ID")
-            pwd = env.get("PTT_PASSWORD") or env.get("PTT_PASS")
-            if acc and pwd:
-                return acc, pwd
-        except Exception:
-            continue
-    return None, None
 
 
 # ===================== Terminal screen buffer =====================
@@ -163,6 +116,8 @@ class TerminalBuffer:
         self.buf: List[List[str]] = [[" "] * cols for _ in range(rows)]
         self.r = 0
         self.c = 0
+        # 跨 feed 的未完成 ESC/CSI（WS 常把序列切半）
+        self._esc_pending = ""
 
     def clear(self):
         self.buf = [[" "] * self.cols for _ in range(self.rows)]
@@ -173,7 +128,6 @@ class TerminalBuffer:
         lines = []
         for row in self.buf:
             lines.append("".join(row).rstrip())
-        # 去掉尾端空白行，但至少保留內容
         while lines and not lines[-1].strip():
             lines.pop()
         return "\n".join(lines)
@@ -207,6 +161,9 @@ class TerminalBuffer:
             self.c += 1
 
     def feed(self, text: str):
+        if self._esc_pending:
+            text = self._esc_pending + text
+            self._esc_pending = ""
         i = 0
         n = len(text)
         while i < n:
@@ -218,18 +175,25 @@ class TerminalBuffer:
             i += 1
 
     def _feed_esc(self, text: str, i: int) -> int:
-        """解析 ESC 序列，回傳下一個未消費 index。"""
+        """解析 ESC 序列，回傳下一個未消費 index。未完成則寫入 _esc_pending。"""
         n = len(text)
         if i + 1 >= n:
-            return i + 1
+            # 只有 ESC，等下一包
+            self._esc_pending = text[i:]
+            if len(self._esc_pending) > 64:
+                self._esc_pending = ""
+            return n
         if text[i + 1] != "[":
-            # 其他 ESC 序列略過單一字元
             return i + 2
 
         j = i + 2
         while j < n and not ("A" <= text[j] <= "Z" or "a" <= text[j] <= "z"):
             j += 1
         if j >= n:
+            # CSI 未完成
+            self._esc_pending = text[i:]
+            if len(self._esc_pending) > 96:
+                self._esc_pending = ""
             return n
 
         params_str = text[i + 2 : j]
@@ -242,7 +206,6 @@ class TerminalBuffer:
                 elif part == "":
                     params.append(0)
                 else:
-                    # 含 ? 等 private mode，忽略
                     params = []
                     break
 
@@ -267,7 +230,6 @@ class TerminalBuffer:
             if mode == 2 or mode == 3:
                 self.clear()
             elif mode == 0:
-                # clear from cursor to end
                 for c in range(self.c, self.cols):
                     self.buf[self.r][c] = " "
                 for r in range(self.r + 1, self.rows):
@@ -288,9 +250,7 @@ class TerminalBuffer:
             elif mode == 2:
                 self.buf[self.r] = [" "] * self.cols
         elif cmd == "m":
-            pass  # SGR 顏色忽略
-        # 其他 CSI 忽略
-
+            pass
         return j + 1
 
 
@@ -587,8 +547,10 @@ class PTTWebSocketClient(QObject):
         self.thread: Optional[threading.Thread] = None
         self._stop = threading.Event()
         self.term = TerminalBuffer(24, 80)
-        self._seen_pushes: Set[str] = set()
+        # 有序去重（FIFO 淘汰），避免 set 切片亂序
+        self._seen_pushes: "OrderedDict[str, None]" = OrderedDict()
         self.action_cooldown = action_cooldown
+        self._kick_other = env_kick_other_sessions()
 
         # 僅作「同一動作不要連打」的短冷卻（不是業務狀態 flag）
         self._last_action_key: Optional[str] = None
@@ -651,8 +613,28 @@ class PTTWebSocketClient(QObject):
         # ASCII / control 直接 latin-1；中文請走 _send_big5
         self._send_bytes(s.encode("latin-1", errors="replace"))
 
+    def _send_login_field(self, text: str, label: str) -> bool:
+        b, err = encode_login_field(text)
+        if err or b is None:
+            self.status.emit(f"{label}無法編碼傳送：{err or 'unknown'}")
+            print(f"[INFO] {label} encode fail: {err}")
+            return False
+        self._send_bytes(b + b"\r")
+        return True
+
     def _send_big5(self, s: str):
         self._send_bytes(encode_big5(s))
+
+    def _remember_push_key(self, key: str) -> bool:
+        """True if new (not seen). FIFO cap."""
+        if key in self._seen_pushes:
+            # 移到最新
+            self._seen_pushes.move_to_end(key)
+            return False
+        self._seen_pushes[key] = None
+        while len(self._seen_pushes) > 2500:
+            self._seen_pushes.popitem(last=False)
+        return True
 
     def _act(self, key: str, payload=None, *, big5: bool = False) -> bool:
         """送出一個動作；相同 key 在 cooldown 內不重送（只防連打，不記業務狀態）。"""
@@ -662,6 +644,7 @@ class PTTWebSocketClient(QObject):
             "login_id_guest": 2.0,
             "login_password": 3.0,
             "duplicate_y": 2.5,
+            "duplicate_n": 2.5,
             "board_stock": 2.0,
             "title_jump": 2.2,
             "title_search": 1.6,
@@ -835,18 +818,23 @@ class PTTWebSocketClient(QObject):
 
         if screen == Screen.LOGIN_ID:
             if self.account:
-                self._act("login_id", self.account + "\r")
+                if self._act("login_id", None):
+                    if not self._send_login_field(self.account, "帳號"):
+                        pass
             else:
                 self._act("login_id_guest", "guest\r")
             return
 
         if screen == Screen.LOGIN_PASSWORD:
-            pwd = (self.password or "") + "\r"
-            self._act("login_password", pwd)
+            if self._act("login_password", None):
+                self._send_login_field(self.password or "", "密碼")
             return
 
         if screen == Screen.DUPLICATE_LOGIN:
-            self._act("duplicate_y", "y\r")
+            if self._kick_other:
+                self._act("duplicate_y", "y\r")
+            else:
+                self._act("duplicate_n", "n\r")
             return
 
         if screen == Screen.ANYKEY:
@@ -1110,12 +1098,9 @@ class PTTWebSocketClient(QObject):
             if not re.fullmatch(r"[A-Za-z0-9_]{2,30}", user):
                 continue
 
-            key = f"{tag}|{user}|{content[:45]}"
-            if key in self._seen_pushes:
+            key = hashlib.sha1(f"{tag}|{user}|{content}".encode("utf-8")).hexdigest()
+            if not self._remember_push_key(key):
                 continue
-            self._seen_pushes.add(key)
-            if len(self._seen_pushes) > 2500:
-                self._seen_pushes = set(list(self._seen_pushes)[-1200:])
 
             push = Push(tag=tag, user=user, content=content, raw=line)
             self.new_push.emit(push)
@@ -1125,6 +1110,28 @@ class PTTWebSocketClient(QObject):
 
 IMAGE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "image")
 IMG_PLACEHOLDER = "[圖]"
+IMAGE_MAX_BYTES = 8 * 1024 * 1024  # 8MB
+IMAGE_MAX_CONCURRENT = 3
+# 允許下載的圖床 host（降低 SSRF / 任意內網抓取）
+IMAGE_HOST_ALLOW = (
+    "imgur.com",
+    "i.imgur.com",
+    "meee.com.tw",
+    "i.meee.com.tw",
+    "pbs.twimg.com",
+    "i.imgur.com",
+    "upload.wikimedia.org",
+    "media.giphy.com",
+    "i.giphy.com",
+    "giphy.com",
+    "i.ibb.co",
+    "ibb.co",
+    "postimg.cc",
+    "i.postimg.cc",
+    "imgur.com",
+    "httpbin.org",  # tests
+    "via.placeholder.com",
+)
 # 圖片 URL：副檔名、/image/png 這類 path、imgur 等
 IMAGE_URL_LOOSE_RE = re.compile(
     r"https?://[^\s<>\"'\]\)]+?"
@@ -1139,15 +1146,62 @@ IMGUR_URL_RE = re.compile(
     r"https?://(?:i\.)?imgur\.com/[\w]+(?:\.(?:png|jpe?g|gif|webp))?",
     re.IGNORECASE,
 )
-# ptt / 圖床常見
 EXTRA_IMAGE_HOST_RE = re.compile(
-    r"https?://(?:(?:i\.)?meee\.com\.tw|mega\.nz|pbs\.twimg\.com)[^\s<>\"'\]\)]+",
+    r"https?://(?:(?:i\.)?meee\.com\.tw|pbs\.twimg\.com|media\.giphy\.com|i\.giphy\.com|"
+    r"i\.ibb\.co|i\.postimg\.cc)[^\s<>\"'\]\)]+",
     re.IGNORECASE,
 )
 
 
 def _sanitize_image_url(url: str) -> str:
     return url.rstrip(".,;:!?)】」』\"'")
+
+
+def _host_allowed(host: str) -> bool:
+    host = (host or "").lower().rstrip(".")
+    if not host:
+        return False
+    for allowed in IMAGE_HOST_ALLOW:
+        if host == allowed or host.endswith("." + allowed):
+            return True
+    return False
+
+
+def _is_public_ip(ip_str: str) -> bool:
+    try:
+        ip = ipaddress.ip_address(ip_str)
+    except ValueError:
+        return False
+    return not (
+        ip.is_private
+        or ip.is_loopback
+        or ip.is_link_local
+        or ip.is_reserved
+        or ip.is_multicast
+        or ip.is_unspecified
+    )
+
+
+def image_url_safe(url: str) -> bool:
+    """Allowlist host + reject private IPs (basic SSRF guard)."""
+    try:
+        p = urlparse(url)
+    except Exception:
+        return False
+    if p.scheme not in ("http", "https"):
+        return False
+    host = p.hostname
+    if not host or not _host_allowed(host):
+        return False
+    try:
+        infos = socket.getaddrinfo(host, None)
+        for info in infos:
+            addr = info[4][0]
+            if not _is_public_ip(addr):
+                return False
+    except Exception:
+        return False
+    return True
 
 
 def extract_image_urls_and_placeholder(content: str) -> Tuple[str, List[str]]:
@@ -1157,6 +1211,9 @@ def extract_image_urls_and_placeholder(content: str) -> Tuple[str, List[str]]:
     def repl(m: re.Match) -> str:
         u = _sanitize_image_url(m.group(0))
         if not u:
+            return m.group(0)
+        if not image_url_safe(u):
+            # 不安全 / 非 allowlist：保留原文，不下載
             return m.group(0)
         if u in urls:
             return IMG_PLACEHOLDER
@@ -1183,15 +1240,18 @@ class CachedImage:
     frames: List[QPixmap]
     delays_ms: List[int]
     total_ms: int = 0
+    # (w,h) -> pre-scaled frames（避免每 paint 都 Smooth scale）
+    _scaled: Dict[Tuple[int, int], List[QPixmap]] = field(default_factory=dict, repr=False)
 
     def __post_init__(self):
         if not self.delays_ms and self.frames:
             self.delays_ms = [100] * len(self.frames)
         if len(self.delays_ms) < len(self.frames):
             self.delays_ms.extend([100] * (len(self.frames) - len(self.delays_ms)))
-        # GIF delay 0 常見 → 用 100ms；下限 20ms 避免狂轉
         self.delays_ms = [max(20, d if d > 0 else 100) for d in self.delays_ms[: len(self.frames)]]
         self.total_ms = max(1, sum(self.delays_ms))
+        if not hasattr(self, "_scaled") or self._scaled is None:
+            self._scaled = {}
 
     @property
     def is_animated(self) -> bool:
@@ -1212,6 +1272,33 @@ class CachedImage:
 
     def first(self) -> QPixmap:
         return self.frames[0] if self.frames else QPixmap()
+
+    def scaled_frame_at(self, t_sec: float, size: QSize) -> QPixmap:
+        key = (size.width(), size.height())
+        if key not in self._scaled:
+            self._scaled[key] = [
+                f.scaled(
+                    size,
+                    Qt.AspectRatioMode.KeepAspectRatio,
+                    Qt.TransformationMode.SmoothTransformation,
+                )
+                for f in self.frames
+            ]
+            # 限制快取組數
+            while len(self._scaled) > 4:
+                self._scaled.pop(next(iter(self._scaled)))
+        frames = self._scaled[key]
+        if not frames:
+            return QPixmap()
+        if len(frames) == 1:
+            return frames[0]
+        ms = int(t_sec * 1000.0) % self.total_ms
+        acc = 0
+        for pm, d in zip(frames, self.delays_ms):
+            acc += d
+            if ms < acc:
+                return pm
+        return frames[-1]
 
 
 def load_cached_image_from_path(path: str) -> Optional[CachedImage]:
@@ -1262,12 +1349,15 @@ class ImageCache(QObject):
         self._inflight: Set[str] = set()
         self._failed: Set[str] = set()
         self._lock = threading.Lock()
+        self._sem = threading.Semaphore(IMAGE_MAX_CONCURRENT)
 
     def disk_path(self, url: str) -> str:
         return os.path.join(self.root, cache_key_for_url(url) + ".img")
 
     def get(self, url: str) -> Optional[CachedImage]:
         if not url or url in self._failed:
+            return None
+        if not image_url_safe(url):
             return None
         with self._lock:
             ci = self._mem.get(url)
@@ -1279,22 +1369,27 @@ class ImageCache(QObject):
             if ci is not None:
                 with self._lock:
                     self._mem[url] = ci
+                    self._trim_mem()
                 return ci
         self.request(url)
         return None
 
-    def get_pixmap(self, url: str, t_sec: Optional[float] = None) -> Optional[QPixmap]:
-        """取目前應顯示的那一幀（GIF 依 t_sec loop）。"""
+    def get_pixmap(self, url: str, t_sec: Optional[float] = None, size: Optional[QSize] = None) -> Optional[QPixmap]:
+        """取目前應顯示的那一幀（GIF 依 t_sec loop）；可帶 size 用預縮放快取。"""
         ci = self.get(url)
         if ci is None or not ci.frames:
             return None
-        if t_sec is None:
-            return ci.first()
-        pm = ci.frame_at(t_sec)
+        t = 0.0 if t_sec is None else t_sec
+        if size is not None and size.width() > 0 and size.height() > 0:
+            pm = ci.scaled_frame_at(t, size)
+        else:
+            pm = ci.frame_at(t)
         return pm if pm and not pm.isNull() else None
 
     def request(self, url: str):
         if not url or url in self._failed:
+            return
+        if not image_url_safe(url):
             return
         with self._lock:
             if url in self._mem or url in self._inflight:
@@ -1311,22 +1406,52 @@ class ImageCache(QObject):
         if ci is not None:
             with self._lock:
                 self._mem[url] = ci
+                self._trim_mem()
             self.image_ready.emit(url)
+
+    def _trim_mem(self):
+        # 最多保留 64 張圖（含 GIF）
+        while len(self._mem) > 64:
+            self._mem.pop(next(iter(self._mem)))
 
     def _download(self, url: str):
         path = self.disk_path(url)
+        if not self._sem.acquire(timeout=30):
+            with self._lock:
+                self._inflight.discard(url)
+            return
         try:
-            r = requests.get(
+            if not image_url_safe(url):
+                raise ValueError("url not allowed")
+            with requests.get(
                 url,
                 timeout=12,
+                stream=True,
+                allow_redirects=True,
                 headers={
                     "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
                     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
                     "Accept": "image/avif,image/webp,image/apng,image/gif,image/*,*/*;q=0.8",
                 },
-            )
-            r.raise_for_status()
-            data = r.content
+            ) as r:
+                r.raise_for_status()
+                # redirect 後再檢查 host
+                final = r.url or url
+                if not image_url_safe(final):
+                    raise ValueError("redirect target not allowed")
+                cl = r.headers.get("Content-Length")
+                if cl and cl.isdigit() and int(cl) > IMAGE_MAX_BYTES:
+                    raise ValueError(f"too large Content-Length {cl}")
+                chunks = []
+                total = 0
+                for chunk in r.iter_content(64 * 1024):
+                    if not chunk:
+                        continue
+                    total += len(chunk)
+                    if total > IMAGE_MAX_BYTES:
+                        raise ValueError("image exceeds size cap")
+                    chunks.append(chunk)
+                data = b"".join(chunks)
             if len(data) < 32:
                 raise ValueError("image too small")
             tmp = path + ".part"
@@ -1341,6 +1466,8 @@ class ImageCache(QObject):
                 self._failed.add(url)
                 self._inflight.discard(url)
             return
+        finally:
+            self._sem.release()
         with self._lock:
             self._inflight.discard(url)
         self.image_ready.emit(url)
@@ -1356,6 +1483,7 @@ class ImageCache(QObject):
             return None
         with self._lock:
             self._mem[url] = ci
+            self._trim_mem()
         return ci
 
 
@@ -1759,6 +1887,18 @@ class DanmakuOverlay(QWidget):
         super().hideEvent(event)
         self._handle.hide()
 
+    def closeEvent(self, event):
+        try:
+            self._timer.stop()
+        except Exception:
+            pass
+        try:
+            if self._handle:
+                self._handle.close()
+        except Exception:
+            pass
+        super().closeEvent(event)
+
     def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton and not self.click_through:
             self._drag_origin = event.globalPosition().toPoint()
@@ -1995,7 +2135,7 @@ class DanmakuOverlay(QWidget):
         if not self.paused:
             still: List[DanmakuItem] = []
             for item in self.active:
-                item.x -= self.SPEED
+                item.x -= item.speed if item.speed else self.SPEED
                 if item.x + item.width >= -12:
                     still.append(item)
             self.active = still
@@ -2108,16 +2248,11 @@ class DanmakuOverlay(QWidget):
             if i < len(parts) - 1:
                 url = image_urls[img_i] if img_i < len(image_urls) else ""
                 img_i += 1
-                pm = self._images.get_pixmap(url, anim_t) if url else None
+                sz = self._image_display_size(url) if url else QSize(0, 0)
+                pm = self._images.get_pixmap(url, anim_t, size=sz) if url else None
                 if pm is not None and not pm.isNull():
-                    sz = self._image_display_size(url)
-                    scaled = pm.scaled(
-                        sz,
-                        Qt.AspectRatioMode.KeepAspectRatio,
-                        Qt.TransformationMode.SmoothTransformation,
-                    )
-                    painter.drawPixmap(int(x), int(img_y), scaled)
-                    x += scaled.width()
+                    painter.drawPixmap(int(x), int(img_y), pm)
+                    x += pm.width()
                 else:
                     w = self._measure(IMG_PLACEHOLDER)
                     self._draw_text_full(painter, x, y, IMG_PLACEHOLDER, self.ROW_H)
