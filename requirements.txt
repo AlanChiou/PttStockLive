@@ -1,0 +1,6 @@
+PyQt6>=6.6
+websocket-client>=1.7
+requests>=2.31
+beautifulsoup4>=4.12
+lxml>=5.0
+uao>=0.1.0; platform_system != "Windows"  # optional for better Big5-UAO decoding
