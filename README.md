@@ -84,4 +84,4 @@ python3 test_ws.py "https://www.ptt.cc/bbs/Stock/M.xxxx.A.xxx.html"
 
 ## 授權
 
-MIT
+[Apache License 2.0](LICENSE)
