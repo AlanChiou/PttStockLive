@@ -1475,10 +1475,10 @@ HIGHLIGHT_WORDS = (
 )
 
 DENSITY_PRESETS = {
-    # name: (lanes, row_h, min_gap, base_speed) — 不截斷正文
-    "疏": (3, 58, 120, 1.6),
-    "中": (4, 52, 100, 2.0),
-    "密": (6, 40, 72, 2.4),
+    # name: (lanes, row_h, min_gap, base_speed) — row 約 2 倍
+    "疏": (3, 116, 120, 1.6),
+    "中": (4, 104, 100, 2.0),
+    "密": (6, 80, 72, 2.4),
 }
 
 
