@@ -90,7 +90,7 @@ python3 test_ws.py "https://www.ptt.cc/bbs/Stock/M.xxxx.A.xxx.html"
 - 預設重複登入會踢掉其他連線（`PTT_KICK_OTHER=0` 可改為保留）
 - WS 連線可能中斷，程式會自動重試
 - Live 刷新間隔約 5–10 秒隨機（LEFT 回列表再進），請勿改成過短以免增加 PTT 負擔
-- 推文圖片僅允許常見圖床 host，且有大小/並發上限
+- 推文圖片不限 domain；仍擋內網 IP，並有大小/並發上限
 - 圖片快取目錄 `image/` 為執行期產物，已在 `.gitignore`
 - 請遵守 PTT 站規，勿高頻洗連線
 - **切勿**把 `.pttrc`、帳號密碼 commit 到 git 或貼給陌生人
@@ -122,7 +122,7 @@ python3 test_ws.py "https://www.ptt.cc/bbs/Stock/M.xxxx.A.xxx.html"
 
 ## 行為與操作（協助解釋 UI）
 - 彈幕窗：半寬、可拖曳；推=綠+👍、噓=紅+👎、→=白+->；字型 PingFang TC 16pt
-- 圖片 URL 會先變 [圖]，下載到 ./image/ 快取後嵌入；GIF 在彈幕飛行期間 loop
+- 圖片 URL 會先變 [圖]，下載到 ./image/ 快取後嵌入（不限 domain；擋內網 IP）；GIF 在彈幕飛行期間 loop
 - 選單：暫停、滑鼠穿透、密度疏/中/密、退出；左上小把手可拖/開選單
 - Live 刷新：約每 5–10 秒隨機 LEFT 回列表再重進文（降低固定節奏壓站）
 - 導航是「看當下終端畫面」決定按鍵，不是靠一堆長期 flag

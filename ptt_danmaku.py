@@ -1112,27 +1112,7 @@ IMAGE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "image")
 IMG_PLACEHOLDER = "[圖]"
 IMAGE_MAX_BYTES = 8 * 1024 * 1024  # 8MB
 IMAGE_MAX_CONCURRENT = 3
-# 允許下載的圖床 host（降低 SSRF / 任意內網抓取）
-IMAGE_HOST_ALLOW = (
-    "imgur.com",
-    "i.imgur.com",
-    "meee.com.tw",
-    "i.meee.com.tw",
-    "pbs.twimg.com",
-    "i.imgur.com",
-    "upload.wikimedia.org",
-    "media.giphy.com",
-    "i.giphy.com",
-    "giphy.com",
-    "i.ibb.co",
-    "ibb.co",
-    "postimg.cc",
-    "i.postimg.cc",
-    "imgur.com",
-    "httpbin.org",  # tests
-    "via.placeholder.com",
-)
-# 圖片 URL：副檔名、/image/png 這類 path、imgur 等
+# 圖片 URL：副檔名、/image/png 這類 path、常見無副檔名圖床
 IMAGE_URL_LOOSE_RE = re.compile(
     r"https?://[^\s<>\"'\]\)]+?"
     r"(?:"
@@ -1157,16 +1137,6 @@ def _sanitize_image_url(url: str) -> str:
     return url.rstrip(".,;:!?)】」』\"'")
 
 
-def _host_allowed(host: str) -> bool:
-    host = (host or "").lower().rstrip(".")
-    if not host:
-        return False
-    for allowed in IMAGE_HOST_ALLOW:
-        if host == allowed or host.endswith("." + allowed):
-            return True
-    return False
-
-
 def _is_public_ip(ip_str: str) -> bool:
     try:
         ip = ipaddress.ip_address(ip_str)
@@ -1183,7 +1153,7 @@ def _is_public_ip(ip_str: str) -> bool:
 
 
 def image_url_safe(url: str) -> bool:
-    """Allowlist host + reject private IPs (basic SSRF guard)."""
+    """只擋明顯危險目標（非 http(s)、解析到內網 IP）；不做 domain allowlist。"""
     try:
         p = urlparse(url)
     except Exception:
@@ -1191,8 +1161,16 @@ def image_url_safe(url: str) -> bool:
     if p.scheme not in ("http", "https"):
         return False
     host = p.hostname
-    if not host or not _host_allowed(host):
+    if not host:
         return False
+    # hostname 本身是 IP 時直接檢查
+    try:
+        if not _is_public_ip(host):
+            # host 可能是域名
+            ipaddress.ip_address(host)
+            return False
+    except ValueError:
+        pass
     try:
         infos = socket.getaddrinfo(host, None)
         for info in infos:
@@ -1200,7 +1178,8 @@ def image_url_safe(url: str) -> bool:
             if not _is_public_ip(addr):
                 return False
     except Exception:
-        return False
+        # DNS 失敗：仍允許嘗試下載（requests 會再失敗）
+        return True
     return True
 
 
@@ -1213,7 +1192,7 @@ def extract_image_urls_and_placeholder(content: str) -> Tuple[str, List[str]]:
         if not u:
             return m.group(0)
         if not image_url_safe(u):
-            # 不安全 / 非 allowlist：保留原文，不下載
+            # 內網等危險目標：保留原文，不下載
             return m.group(0)
         if u in urls:
             return IMG_PLACEHOLDER
