@@ -266,6 +266,7 @@ class Screen(Enum):
     BOARD_LIST = auto()
     TITLE_SEARCH_PROMPT = auto()
     ARTICLE = auto()
+    PMORE_HELP = auto()
     LOGGING_IN = auto()
     UNKNOWN = auto()
 
@@ -273,6 +274,20 @@ class Screen(Enum):
 def _last_nonempty_lines(frame: str, n: int = 3) -> List[str]:
     lines = [ln for ln in frame.splitlines() if ln.strip()]
     return lines[-n:] if lines else []
+
+
+def is_pmore_help(frame: str) -> bool:
+    """文章內按 h 跳出的 pmore 使用說明（需 LEFT/q 關掉，否則卡死）。"""
+    if not frame:
+        return False
+    low = frame.lower()
+    if "pmore" in low and ("使用說明" in frame or "more:" in low or "瀏覽程式" in frame):
+        return True
+    if "瀏覽程式使用說明" in frame:
+        return True
+    if "基本移動" in frame and "進階瀏覽" in frame and ("下翻一頁" in frame or "搜尋關鍵字" in frame):
+        return True
+    return False
 
 
 def parse_status_row(frame: str) -> Optional[dict]:
@@ -337,6 +352,27 @@ def is_target_stock_thread(frame: str) -> bool:
     return False
 
 
+def keyword_for_thread(best: dict) -> str:
+    """由列表候選列組成標題搜尋關鍵字。"""
+    if best.get("date") and len(best["date"]) >= 8:
+        return f"{best['date']} {'盤中' if best.get('kind') == '盤中' else '盤後'}"
+    return "盤中" if best.get("kind") == "盤中" else "盤後閒聊"
+
+
+def has_search_hit_cursor(frame: str) -> bool:
+    """搜尋結果列上是否有游標且像閒聊/日期目標（避免盲 RIGHT 進公告）。"""
+    for line in frame.splitlines():
+        s = line.strip()
+        if "●" not in s and not s.lstrip().startswith(">"):
+            continue
+        if "[閒聊]" in s or "盤中" in s or "盤後" in s:
+            return True
+        # 搜尋結果常截成「[閒聊] 2026/」
+        if re.search(r"\d{4}/\d{0,2}", s) and ("閒聊" in s or "盤" in s):
+            return True
+    return False
+
+
 def detect_screen(frame: str) -> Screen:
     """只看當下畫面文字，不看歷史、不看 flag。"""
     if not frame or not frame.strip():
@@ -357,6 +393,10 @@ def detect_screen(frame: str) -> Screen:
         "重複登入" in frame and "[Y/n]" in frame
     ):
         return Screen.DUPLICATE_LOGIN
+
+    # pmore 說明（優先於 ARTICLE：殘留「瀏覽」字樣勿當文內）
+    if is_pmore_help(frame):
+        return Screen.PMORE_HELP
 
     # 任意鍵 cover（優先看最底列，貼近 PttChrome pageState=5）
     bottom = "\n".join(_last_nonempty_lines(frame, 4))
@@ -560,7 +600,10 @@ class PTTWebSocketClient(QObject):
         # 進正確目標文後，待滿 interval 才 LEFT 刷新（減輕 PTT 負擔：5–10 秒隨機）
         self._article_entered_at: float = 0.0
         self._refresh_interval: float = self._next_refresh_interval()
-        # 短 cooldown key 對齊 PttChrome：LEFT+RIGHT+END 中 RIGHT 後必須驗文
+        # 列表重找：避免 board_end ↔ title_jump 盤後/盤中 無限來回
+        self._search_tried_intraday: bool = False
+        self._search_backoff_until: float = 0.0
+        self._search_cycle_id: int = 0
 
     def start(self):
         if self.thread and self.thread.is_alive():
@@ -648,16 +691,21 @@ class PTTWebSocketClient(QObject):
             "board_stock": 2.0,
             "title_jump": 2.2,
             "title_search": 1.6,
-            "enter_article": 1.2,
-            "board_end": 1.8,
+            "enter_article": 1.5,
+            "board_end": 2.5,
             "article_end": 1.5,
             "article_wrong": 1.2,
             "refresh_leave": 2.5,
+            "pmore_dismiss": 1.0,
             "anykey_space": 0.9,
             "main_s": 1.5,
+            "search_backoff": 0.0,
         }
         cd = special_cd.get(key, self.action_cooldown)
         if key.startswith("title_jump"):
+            # 不同關鍵字之間也共用較長冷卻，避免 盤後/盤中 連打
+            if (self._last_action_key or "").startswith("title_jump") and (now - self._last_action_time) < 3.5:
+                return False
             cd = 2.2
         if key == self._last_action_key and (now - self._last_action_time) < cd:
             return False
@@ -708,6 +756,9 @@ class PTTWebSocketClient(QObject):
             self._last_action_time = 0.0
             self._last_screen = Screen.UNKNOWN
             self._article_entered_at = 0.0
+            self._search_tried_intraday = False
+            self._search_backoff_until = 0.0
+            self._search_cycle_id = 0
             last_error = ""
             ws = None
 
@@ -841,6 +892,11 @@ class PTTWebSocketClient(QObject):
             self._act("anykey_space", " ")
             return
 
+        if screen == Screen.PMORE_HELP:
+            # 關掉說明回到列表/文章（LEFT 與 PttChrome 離開一致）
+            self._act("pmore_dismiss", PTT_KEY_LEFT)
+            return
+
         if screen == Screen.MAIN_MENU:
             # 主功能表 → s 搜尋看板
             self._act("main_s", "s")
@@ -873,11 +929,17 @@ class PTTWebSocketClient(QObject):
         cands = find_target_threads(frame)
         best = pick_best_thread(cands)
         if best:
-            if best.get("date") and len(best["date"]) >= 8:
-                return f"{best['date']} {'盤中' if best['kind'] == '盤中' else '盤後'}"
-            return "盤中" if best["kind"] == "盤中" else "盤後閒聊"
+            return keyword_for_thread(best)
         # 預設先找盤後閒聊（收盤後較常需要）；盤中關鍵字較短易誤中
         return "盤後閒聊"
+
+    def _begin_search_backoff(self, seconds: float = 8.0, reason: str = ""):
+        """一整輪 盤後→盤中 都找不到時暫停，避免狂刷 PTT。"""
+        self._search_backoff_until = time.time() + seconds
+        self._search_tried_intraday = False
+        self._search_cycle_id += 1
+        if reason:
+            print(f"[CHECK] 搜尋暫停 {seconds:.0f}s: {reason}")
 
     def _nav_board_list(self, frame: str):
         """
@@ -886,73 +948,104 @@ class PTTWebSocketClient(QObject):
         - 刷新時只會 LEFT 回列表；游標/anchor 可能已飄移
         - 因此「絕不能」假設游標仍在原文章，盲目 RIGHT
         - 必須依當下畫面確認目標列，再 > / Enter；進文後再驗標題
+        - 錯文 LEFT 後：穩定 title 搜尋，禁止 board_end↔盤後↔盤中 無限翻轉
         """
+        now = time.time()
         cands = find_target_threads(frame)
         best = pick_best_thread(cands)
         last = self._last_action_key or ""
-        age = time.time() - self._last_action_time
+        age = now - self._last_action_time
 
-        just_refreshed = last == "refresh_leave" and age < 6.0
-        just_searched = (last.startswith("title_jump") or last == "title_search") and age < 10.0
+        just_refreshed = last == "refresh_leave" and age < 8.0
+        just_wrong = last == "article_wrong" and age < 10.0
+        just_searched = (last.startswith("title_jump") or last == "title_search") and age < 14.0
+        just_end = last == "board_end" and age < 8.0
+        just_enter = last == "enter_article" and age < 4.0
 
-        # 0) 剛搜完：結果列常是 ● 在第一筆（標題可能被截斷），直接進
-        if just_searched:
-            if best and best.get("cursor"):
-                self._act("enter_article", PTT_KEY_RIGHT)
-                return
-            # 有 ● 且像閒聊搜尋結果
-            if re.search(r"●[^\n]*\[閒聊\]", frame) or re.search(r"●[^\n]*\d{4}/", frame):
-                self._act("enter_article", PTT_KEY_RIGHT)
-                return
-            if best:
-                # 搜尋結果已列出但游標偵測失敗 → 仍嘗試進第一筆
-                self._act("enter_article", PTT_KEY_RIGHT)
-                return
-            # 結果還沒刷出來，等下一 tick
-            if age < 3.0:
-                return
+        # 找到目標就清 backoff / 盤中試過旗標
+        if best:
+            self._search_backoff_until = 0.0
+            self._search_tried_intraday = False
 
-        # 1) 游標已在目標列 → RIGHT 進入
+        # 1) 游標已在目標列 → RIGHT
         if best and best.get("cursor"):
             self._act("enter_article", PTT_KEY_RIGHT)
             return
 
-        # 2) 畫面已有目標
-        if best:
-            if just_refreshed:
-                if best.get("date") and len(best["date"]) >= 8:
-                    keyword = f"{best['date']} {'盤中' if best['kind'] == '盤中' else '盤後'}"
-                else:
-                    keyword = "盤中" if best["kind"] == "盤中" else "盤後閒聊"
-                self._title_jump(keyword)
+        # 2) 剛搜完：等結果；有目標或游標像搜尋命中才進
+        if just_searched:
+            if age < 2.0:
+                return  # 等列表重繪
+            if best:
+                # 搜尋結果列出但 ● 偵測失敗 → 進第一筆目標
+                self._act("enter_article", PTT_KEY_RIGHT)
                 return
-            # 已在列表看到目標但游標不在其上 → 標題跳轉定位
-            if best.get("date") and len(best["date"]) >= 8:
-                keyword = f"{best['date']} {'盤中' if best['kind'] == '盤中' else '盤後'}"
-            else:
-                keyword = "盤中" if best["kind"] == "盤中" else "盤後閒聊"
-            # 避免 title_jump 後又立刻 jump 同一個
-            if last.startswith("title_jump") and age < 5.0:
+            if has_search_hit_cursor(frame):
+                self._act("enter_article", PTT_KEY_RIGHT)
+                return
+            if age < 5.0:
+                return  # 再等一會兒
+            # 盤後找不到 → 試一次盤中；之後 backoff，不再 board_end 迴圈
+            if "盤後" in last and not self._search_tried_intraday:
+                self._search_tried_intraday = True
+                self._title_jump("盤中")
+                return
+            if age < 10.0:
+                return
+            # 已在 backoff 中：只靜默等待，不要每 tick 重設計時
+            if now < self._search_backoff_until:
+                return
+            self._begin_search_backoff(8.0, "盤後/盤中 皆無結果")
+            return
+
+        # 3) 畫面已有目標但游標不在其上 → 標題跳轉定位
+        if best:
+            keyword = keyword_for_thread(best)
+            # 同一關鍵字短時間不重送
+            if last == f"title_jump:{keyword}" and age < 6.0:
+                if age >= 2.0:
+                    self._act("enter_article", PTT_KEY_RIGHT)
+                return
+            if last.startswith("title_jump") and age < 4.0:
                 return
             self._title_jump(keyword)
             return
 
-        # 3) 畫面沒有目標字樣
-        if last.startswith("title_jump") or last == "title_search":
-            if age < 3.0:
-                return  # 等結果
-            # 盤後找不到再試盤中
-            if "盤後" in last and age >= 3.0:
-                self._title_jump("盤中")
-                return
-            if age > 12:
-                self._act("board_end", "$")
+        # 4) 畫面沒有目標（含 just_searched 已結束後仍在 backoff）
+        if now < self._search_backoff_until:
             return
 
-        if last != "board_end":
+        # 剛 RIGHT 仍在列表（沒進文）→ 等一下，勿立刻 board_end
+        if just_enter:
+            return
+        if last == "enter_article" and age < 8.0:
+            # 進文失敗：直接重搜，不要 $ 再翻一次
+            self._title_jump("盤後閒聊")
+            return
+
+        # 錯文 LEFT / Live 刷新 LEFT：等畫面穩後 title 搜尋（不必先 $）
+        if just_wrong or just_refreshed:
+            if age < 1.5:
+                return
+            self._search_tried_intraday = False
+            self._title_jump(self._search_keyword_from_context(frame))
+            return
+
+        # 剛 $ 到板底：等列表更新
+        if just_end:
+            if age < 2.0:
+                return
+            # 板底仍無目標 → 搜盤後
+            self._search_tried_intraday = False
+            self._title_jump("盤後閒聊")
+            return
+
+        # 初始進板或迷路：先 $ 看置底串（只送一次，成功後走 just_end 分支）
+        if last != "board_end" or age > 20.0:
             self._act("board_end", "$")
             return
-        # 板底仍沒有 → 搜尋盤後閒聊
+
+        # last 仍是 board_end 且過了 just_end 窗：保險重搜
         self._title_jump("盤後閒聊")
 
     def _nav_article(self, frame: str):
@@ -969,17 +1062,25 @@ class PTTWebSocketClient(QObject):
         has_push = bool(re.search(r"^[推噓→]", frame, re.M))
         status = parse_status_row(frame)
 
+        # pmore 說明殘影（detect 漏網時）
+        if is_pmore_help(frame):
+            self._act("pmore_dismiss", PTT_KEY_LEFT)
+            return
+
         # --- 進文檢查：有標題列才驗是不是盤中/盤後 ---
         # 文末常只剩狀態列 + 推文，沒有「標題」列，不能當錯文 LEFT（否則一直甩出）
         title = extract_article_title(frame)
         if title and not is_target_stock_thread(frame):
             print(f"[CHECK] 非目標文章，LEFT 重找: {_log_safe(title, 60)}")
             self._article_entered_at = 0.0
+            self._search_tried_intraday = False
             self._act("article_wrong", PTT_KEY_LEFT)
             return
 
         if self._article_entered_at <= 0:
             self._article_entered_at = now
+            self._search_backoff_until = 0.0
+            self._search_tried_intraday = False
             self._emit_ui("live")
             if title:
                 print(f"[CHECK] 目標文章確認: {_log_safe(title, 60)}")
