@@ -352,11 +352,88 @@ def is_target_stock_thread(frame: str) -> bool:
     return False
 
 
+_FULL_DATE_RE = re.compile(r"(\d{4}/\d{2}/\d{2})")
+
+
+def is_full_thread_date(date: str) -> bool:
+    """標題日期必須是完整 YYYY/MM/DD（拒絕列表欄 7/08、截斷 2026/0）。"""
+    if not date or not _FULL_DATE_RE.fullmatch(date):
+        return False
+    try:
+        y, m, d = date.split("/")
+        yi, mi, di = int(y), int(m), int(d)
+        return 2000 <= yi <= 2100 and 1 <= mi <= 12 and 1 <= di <= 31
+    except Exception:
+        return False
+
+
+def extract_title_date_from_list_line(line: str) -> str:
+    """
+    從列表列取「標題裡」的 YYYY/MM/DD。
+    不可用左側「日 期」欄（如 7/08、6/25），否則會跳到舊文。
+    """
+    s = line.strip()
+    # 標準：[閒聊] 2026/07/20 …
+    m = re.search(r"\[閒聊\]\s*(\d{4}/\d{2}/\d{2})", s)
+    if m:
+        return m.group(1)
+    # 標題區在 □ / ◆ / R: 之後
+    m = re.search(
+        r"(?:□|◆|R:)\s*(?:\[閒聊\]\s*)?(\d{4}/\d{2}/\d{2})",
+        s,
+    )
+    if m:
+        return m.group(1)
+    # 標題殘：2026/07/20 盤中/盤後
+    m = re.search(r"(\d{4}/\d{2}/\d{2})\s*盤[中後]", s)
+    if m:
+        return m.group(1)
+    return ""
+
+
+def extract_kind_from_list_line(line: str) -> Optional[str]:
+    s = line
+    if "盤中" in s:
+        return "盤中"
+    if "盤後" in s:
+        return "盤後"
+    return None
+
+
+def parse_live_target_from_title(title: str) -> Optional[dict]:
+    """從已確認的文章標題列記住要追的日期/種類（供 refresh 重定位）。"""
+    if not title:
+        return None
+    m = re.search(r"(\d{4}/\d{2}/\d{2})\s*(盤[中後])", title)
+    if m:
+        kind = "盤中" if "中" in m.group(2) else "盤後"
+        return {"date": m.group(1), "kind": kind, "title": title}
+    if re.search(r"\[閒聊\].*盤中|盤中閒聊", title):
+        return {"date": "", "kind": "盤中", "title": title}
+    if re.search(r"\[閒聊\].*盤後|盤後閒聊", title):
+        return {"date": "", "kind": "盤後", "title": title}
+    return None
+
+
 def keyword_for_thread(best: dict) -> str:
     """由列表候選列組成標題搜尋關鍵字。"""
-    if best.get("date") and len(best["date"]) >= 8:
-        return f"{best['date']} {'盤中' if best.get('kind') == '盤中' else '盤後'}"
+    d = best.get("date") or ""
+    if is_full_thread_date(d):
+        return f"{d} {'盤中' if best.get('kind') == '盤中' else '盤後'}"
     return "盤中" if best.get("kind") == "盤中" else "盤後閒聊"
+
+
+def keyword_for_live_target(live: Optional[dict]) -> Optional[str]:
+    if not live:
+        return None
+    d = live.get("date") or ""
+    if is_full_thread_date(d):
+        return f"{d} {'盤中' if live.get('kind') == '盤中' else '盤後'}"
+    if live.get("kind") == "盤中":
+        return "盤中"
+    if live.get("kind") == "盤後":
+        return "盤後閒聊"
+    return None
 
 
 def has_search_hit_cursor(frame: str) -> bool:
@@ -371,6 +448,21 @@ def has_search_hit_cursor(frame: str) -> bool:
         if re.search(r"\d{4}/\d{0,2}", s) and ("閒聊" in s or "盤" in s):
             return True
     return False
+
+
+def thread_matches_live(best: dict, live: Optional[dict]) -> bool:
+    """列表候選是否與已確認 live 目標同一篇（允許標題截斷）。"""
+    if not live or not best:
+        return True
+    ld = live.get("date") or ""
+    bd = best.get("date") or ""
+    if is_full_thread_date(ld) and is_full_thread_date(bd) and bd != ld:
+        return False
+    if live.get("kind") and best.get("kind") and best["kind"] != live["kind"]:
+        # 截斷列常缺 盤中/盤後 → best.kind 可能是猜的；僅在雙方都明確時比
+        if "盤中" in (best.get("line") or "") or "盤後" in (best.get("line") or ""):
+            return False
+    return True
 
 
 def detect_screen(frame: str) -> Screen:
@@ -478,37 +570,44 @@ def find_target_threads(frame: str) -> List[dict]:
             continue
 
         kind = None
-        date = None
+        date = ""
         m = THREAD_TITLE_RE.search(s)
         if m:
             kind = m.group("kind")
-            date = m.group("date")
+            raw_date = m.group("date") or ""
             if kind and kind.startswith("盤中"):
                 kind = "盤中"
             else:
                 kind = "盤後"
+            # 正則抓到的 date 再以「標題區」為準，避免被列表左欄污染
+            date = extract_title_date_from_list_line(s) or (
+                raw_date if is_full_thread_date(raw_date) else ""
+            )
         elif "盤中" in s or "盤後" in s:
             kind = "盤中" if "盤中" in s else "盤後"
-            dm = re.search(r"(\d{4}/\d{2}/\d{2})", s)
-            if dm:
-                date = dm.group(1)
-            else:
-                dm2 = re.search(r"(\d{1,2}/\d{1,2})", s)
-                date = dm2.group(1) if dm2 else None
-        elif "[閒聊]" in s and re.search(r"\d{4}/\d{1,2}|\d{1,2}/\d{1,2}", s):
-            # 搜尋結果常被截成「[閒聊] 2026/」沒有「盤後」二字
-            kind = "盤後" if "盤中" not in s else "盤中"
-            dm = re.search(r"(\d{4}/\d{2}/\d{2})", s)
-            if dm:
-                date = dm.group(1)
-            else:
-                dm2 = re.search(r"(\d{1,2}/\d{1,2})", s)
-                date = dm2.group(1) if dm2 else None
+            date = extract_title_date_from_list_line(s)
+        elif "[閒聊]" in s:
+            # 搜尋結果常被截成「[閒聊] 2026/」沒有「盤中/盤後」
+            # 不可用左欄 7/08 當標題日；kind 不明時先空，由 live/預設補
+            kind = extract_kind_from_list_line(s)
+            date = extract_title_date_from_list_line(s)
+            if kind is None:
+                # 截斷列：有 [閒聊]+年份片段才當候選，kind 暫標 盤中（日更兩串皆可被 ?盤中 / ?盤後 再精煉）
+                if re.search(r"\[閒聊\]\s*\d{4}", s) or "閒聊" in s:
+                    kind = "盤中"  # 佔位；pick 時完整日期列優先
+                else:
+                    continue
         else:
             continue
 
+        if kind is None:
+            continue
+
         num = None
-        nm = re.search(r"(\d{4,})", s)
+        # 文章編號通常在列前段；避免吃到標題年份
+        nm = re.search(r"^[●>\s]*(\d{4,6})\b", s)
+        if not nm:
+            nm = re.search(r"\s(\d{4,6})\s+\S+\s+\d{1,2}/\d{1,2}", s)
         if nm:
             num = int(nm.group(1))
 
@@ -518,7 +617,7 @@ def find_target_threads(frame: str) -> List[dict]:
             {
                 "line": s,
                 "kind": kind,
-                "date": date or "",
+                "date": date if is_full_thread_date(date) else "",
                 "num": num or 0,
                 "starred": starred,
                 "cursor": cursor,
@@ -528,20 +627,23 @@ def find_target_threads(frame: str) -> List[dict]:
 
 
 def pick_best_thread(candidates: List[dict]) -> Optional[dict]:
-    """優先較新日期；同日優先盤中。"""
+    """優先完整且較新的 YYYY/MM/DD；同日優先盤中。不用 MM/DD 字串硬比。"""
     if not candidates:
         return None
 
     def sort_key(c):
-        # date 字串 YYYY/MM/DD 可直接比；MM/DD 次之
         d = c.get("date") or ""
-        kind_rank = 0 if c.get("kind") == "盤中" else 1
-        return (d, -c.get("num", 0), kind_rank)
+        full = 1 if is_full_thread_date(d) else 0
+        # reverse=True：完整日期 > 較新 YYYY/MM/DD > 較大編號 > 置底星號 > 盤中
+        return (
+            full,
+            d if full else "",
+            c.get("num", 0),
+            1 if c.get("starred") else 0,
+            1 if c.get("kind") == "盤中" else 0,
+        )
 
-    # 有完整日期的優先
-    with_date = [c for c in candidates if c.get("date")]
-    pool = with_date if with_date else candidates
-    return sorted(pool, key=sort_key, reverse=True)[0]
+    return sorted(candidates, key=sort_key, reverse=True)[0]
 
 
 # ===================== Push model =====================
@@ -604,6 +706,8 @@ class PTTWebSocketClient(QObject):
         self._search_tried_intraday: bool = False
         self._search_backoff_until: float = 0.0
         self._search_cycle_id: int = 0
+        # 已確認的 live 目標（標題驗過後記住），refresh 時優先用此關鍵字重定位
+        self._live_target: Optional[dict] = None
 
     def start(self):
         if self.thread and self.thread.is_alive():
@@ -759,6 +863,7 @@ class PTTWebSocketClient(QObject):
             self._search_tried_intraday = False
             self._search_backoff_until = 0.0
             self._search_cycle_id = 0
+            self._live_target = None
             last_error = ""
             ws = None
 
@@ -925,7 +1030,10 @@ class PTTWebSocketClient(QObject):
             return
 
     def _search_keyword_from_context(self, frame: str) -> str:
-        """只依當下畫面線索選標題搜尋關鍵字。"""
+        """優先已確認 live 目標，否則依當下畫面線索。"""
+        live_kw = keyword_for_live_target(self._live_target)
+        if live_kw:
+            return live_kw
         cands = find_target_threads(frame)
         best = pick_best_thread(cands)
         if best:
@@ -949,6 +1057,7 @@ class PTTWebSocketClient(QObject):
         - 因此「絕不能」假設游標仍在原文章，盲目 RIGHT
         - 必須依當下畫面確認目標列，再 > / Enter；進文後再驗標題
         - 錯文 LEFT 後：穩定 title 搜尋，禁止 board_end↔盤後↔盤中 無限翻轉
+        - 已確認 live 後 refresh：用該日期關鍵字重找，勿被截斷列表的舊 7/08 帶跑
         """
         now = time.time()
         cands = find_target_threads(frame)
@@ -967,20 +1076,36 @@ class PTTWebSocketClient(QObject):
             self._search_backoff_until = 0.0
             self._search_tried_intraday = False
 
-        # 1) 游標已在目標列 → RIGHT
+        # 0) Live 刷新 / 錯文：先用已確認標題關鍵字重定位（不信任游標與截斷列表）
+        if just_wrong or just_refreshed:
+            if age < 1.5:
+                return
+            self._search_tried_intraday = False
+            kw = self._search_keyword_from_context(frame)
+            print(f"[CHECK] 重定位搜尋: {_log_safe(kw, 40)}")
+            self._title_jump(kw)
+            return
+
+        # 1) 游標已在目標列 → RIGHT（但不可進比 live 更舊的串）
         if best and best.get("cursor"):
-            self._act("enter_article", PTT_KEY_RIGHT)
+            if thread_matches_live(best, self._live_target):
+                self._act("enter_article", PTT_KEY_RIGHT)
+                return
+            # 游標停在舊閒聊 → 跳回 live
+            kw = keyword_for_live_target(self._live_target) or keyword_for_thread(best)
+            if last != f"title_jump:{kw}" or age >= 4.0:
+                self._title_jump(kw)
             return
 
         # 2) 剛搜完：等結果；有目標或游標像搜尋命中才進
         if just_searched:
             if age < 2.0:
                 return  # 等列表重繪
-            if best:
-                # 搜尋結果列出但 ● 偵測失敗 → 進第一筆目標
+            if best and thread_matches_live(best, self._live_target):
                 self._act("enter_article", PTT_KEY_RIGHT)
                 return
             if has_search_hit_cursor(frame):
+                # 用 live 關鍵字搜過時，第一筆命中通常就是目標
                 self._act("enter_article", PTT_KEY_RIGHT)
                 return
             if age < 5.0:
@@ -1000,7 +1125,8 @@ class PTTWebSocketClient(QObject):
 
         # 3) 畫面已有目標但游標不在其上 → 標題跳轉定位
         if best:
-            keyword = keyword_for_thread(best)
+            # 有 live 時優先其日期（截斷列表的舊 7/08 不可蓋過）
+            keyword = keyword_for_live_target(self._live_target) or keyword_for_thread(best)
             # 同一關鍵字短時間不重送
             if last == f"title_jump:{keyword}" and age < 6.0:
                 if age >= 2.0:
@@ -1019,15 +1145,7 @@ class PTTWebSocketClient(QObject):
         if just_enter:
             return
         if last == "enter_article" and age < 8.0:
-            # 進文失敗：直接重搜，不要 $ 再翻一次
-            self._title_jump("盤後閒聊")
-            return
-
-        # 錯文 LEFT / Live 刷新 LEFT：等畫面穩後 title 搜尋（不必先 $）
-        if just_wrong or just_refreshed:
-            if age < 1.5:
-                return
-            self._search_tried_intraday = False
+            # 進文失敗：用 live 或預設重搜
             self._title_jump(self._search_keyword_from_context(frame))
             return
 
@@ -1035,9 +1153,8 @@ class PTTWebSocketClient(QObject):
         if just_end:
             if age < 2.0:
                 return
-            # 板底仍無目標 → 搜盤後
             self._search_tried_intraday = False
-            self._title_jump("盤後閒聊")
+            self._title_jump(self._search_keyword_from_context(frame))
             return
 
         # 初始進板或迷路：先 $ 看置底串（只送一次，成功後走 just_end 分支）
@@ -1046,7 +1163,7 @@ class PTTWebSocketClient(QObject):
             return
 
         # last 仍是 board_end 且過了 just_end 窗：保險重搜
-        self._title_jump("盤後閒聊")
+        self._title_jump(self._search_keyword_from_context(frame))
 
     def _nav_article(self, frame: str):
         """
@@ -1074,8 +1191,34 @@ class PTTWebSocketClient(QObject):
             print(f"[CHECK] 非目標文章，LEFT 重找: {_log_safe(title, 60)}")
             self._article_entered_at = 0.0
             self._search_tried_intraday = False
+            # 非目標不更新 live；保留舊 live 以便重找正確串
             self._act("article_wrong", PTT_KEY_LEFT)
             return
+
+        # 進到目標文但比 live 更舊（截斷列表誤導）→ LEFT 重找
+        if title and is_target_stock_thread(frame) and self._live_target:
+            incoming = parse_live_target_from_title(title)
+            live_d = (self._live_target or {}).get("date") or ""
+            in_d = (incoming or {}).get("date") or ""
+            if is_full_thread_date(live_d) and is_full_thread_date(in_d) and in_d < live_d:
+                print(
+                    f"[CHECK] 進到較舊閒聊 ({in_d} < {live_d})，LEFT 重找"
+                )
+                self._article_entered_at = 0.0
+                self._act("article_wrong", PTT_KEY_LEFT)
+                return
+
+        # 只要標題列還在就更新 live（END 後標題消失也不清）
+        if title and is_target_stock_thread(frame):
+            parsed = parse_live_target_from_title(title)
+            if parsed:
+                old_d = (self._live_target or {}).get("date") or ""
+                new_d = parsed.get("date") or ""
+                if not self._live_target or not is_full_thread_date(old_d) or (
+                    is_full_thread_date(new_d) and new_d >= old_d
+                ):
+                    if self._live_target != parsed:
+                        self._live_target = parsed
 
         if self._article_entered_at <= 0:
             self._article_entered_at = now
