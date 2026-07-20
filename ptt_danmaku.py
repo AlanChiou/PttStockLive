@@ -1569,12 +1569,6 @@ class ImageCache(QObject):
 
 # ===================== Danmaku overlay (UI/UX) =====================
 
-# 可選高亮（股市閒聊常見字）
-HIGHLIGHT_WORDS = (
-    "融資", "跌停", "漲停", "殺盤", "反彈", "空單", "多單",
-    "AI", "台積", "大盤", "期貨", "選擇權",
-)
-
 DENSITY_PRESETS = {
     # name: (lanes, row_h, min_gap, base_speed) — row 約 2 倍
     "疏": (3, 116, 120, 1.6),
@@ -2175,14 +2169,8 @@ class DanmakuOverlay(QWidget):
         return None
 
     def _spawn_pending(self, p: PendingPush) -> bool:
-        content = p.content
-        for kw in HIGHLIGHT_WORDS:
-            if kw in content and IMG_PLACEHOLDER not in kw:
-                content = content.replace(kw, f"〔{kw}〕", 1)
-                break
-
-        # 一段連續文字：👍 user：內文
-        text = format_danmaku_text(p.tag, p.user, content)
+        # 一段連續文字：👍 user：內文（原文，不額外加括號）
+        text = format_danmaku_text(p.tag, p.user, p.content)
         total_w = self._measure_line_with_images(text, p.image_urls)
 
         spawn_x = float(self.width())
